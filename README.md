@@ -592,6 +592,21 @@ r = agent.predict_long(state, questions)
 r["answers"]["refund"]["window"]   # {'index': 13, 'token_start': 4680, 'token_end': 5432, 'count': 14}
 ```
 
+### Images (vision checkpoints)
+
+A vision checkpoint reads images next to the text, in the same forward pass, with the same typed
+and calibrated answers. Install `laya[vision]` and pass `images=` (PIL images, file paths or bytes,
+in order; the model sees them as "image 1", "image 2"):
+
+```python
+agent.predict(ticket, questions, images=["screenshot.png"], image_patches=2048)
+```
+
+`image_patches` sets how much detail the vision tower keeps (2048 keeps small text in a 1080p
+screenshot legible) without growing the per-question cost, which a per-image token cap bounds.
+No trained vision checkpoint is published yet; the runtime, data builder and training scripts are
+documented in [docs/vision.md](docs/vision.md), with measured latency.
+
 ---
 
 ## GPU Fast Path (TileLang)
