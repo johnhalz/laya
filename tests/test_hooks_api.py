@@ -90,6 +90,14 @@ for label, fn in (("Agent.predict_batch", Agent.predict_batch),
     check_param(label, fn, "max_len", None)
     check_param(label, fn, "head_max_len", None)
 
+# images and the per-call vision patch budget (vision checkpoints)
+for label, fn in (("Agent.predict_batch", Agent.predict_batch),
+                  ("Agent.system_one", Agent.system_one),
+                  ("Router.predict", Router.predict)):
+    check_param(label, fn, "images", None)
+    check_param(label, fn, "image_patches", None)
+check_param("Router.route", Router.route, "images", None)
+
 # route() takes per-call hooks so a hook can pin a checkpoint for one call
 check_param("Router.route", Router.route, "hooks", None)
 check_param("Router.route", Router.route, "hooks_raise", None)
@@ -102,13 +110,14 @@ check_true("ONNXAgent.predict is ONNXAgent.system_one", ONNXAgent.predict is ONN
 
 # --------------------------------------------------------------- context
 FIELDS = ["states", "questions", "run_id", "results", "decision", "model", "agent", "router",
-          "max_len", "head_max_len", "usage", "started_at", "elapsed_ms", "error"]
+          "max_len", "head_max_len", "usage", "started_at", "elapsed_ms", "error", "images", "image_patches"]
 check("PredictContext fields", [f.name for f in dataclasses.fields(PredictContext)], FIELDS)
 check("PredictContext/states required", PredictContext.__dataclass_fields__["states"].default,
       dataclasses.MISSING)
 check("PredictContext/questions required", PredictContext.__dataclass_fields__["questions"].default,
       dataclasses.MISSING)
-for optional in ("results", "decision", "model", "agent", "router", "usage", "elapsed_ms", "error"):
+for optional in ("results", "decision", "model", "agent", "router", "usage", "elapsed_ms", "error",
+                 "images", "image_patches"):
     check("PredictContext/%s default None" % optional,
           PredictContext.__dataclass_fields__[optional].default, None)
 check_true("PredictContext/skip exists", callable(getattr(PredictContext, "skip", None)))

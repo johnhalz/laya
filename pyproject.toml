@@ -54,6 +54,9 @@ structured = ["pydantic>=2.0.0"]
 
 onnx = ["onnx", "onnxruntime"]
 
+# `pip install laya[vision]` adds image input for vision checkpoints (SigLIP2 needs transformers 4.49+).
+vision = ["pillow>=9.0", "transformers>=4.49.0"]
+
 # `pip install laya[langchain]` adds the LangChain / LangGraph integrations (laya.integrations).
 langchain = [
     "langchain-core>=0.2.0",

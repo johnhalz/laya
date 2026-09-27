@@ -44,6 +44,8 @@ class PredictContext:
     started_at: float = field(default_factory=time.perf_counter)
     elapsed_ms: Optional[float] = None
     error: Optional[BaseException] = None
+    images: Optional[List[Any]] = None              # one list of images per state (vision checkpoints)
+    image_patches: Optional[int] = None             # per-call vision tower patch budget
 
     def skip(self, results: List[Dict[str, Any]]) -> None:
         """Set cached results from a start hook; inference is skipped, end hooks still run."""

@@ -1,4 +1,5 @@
 """Core model architecture, token sequence construction, and confidence estimation for laya."""
+import io
 import json
 import math
 import os
@@ -100,17 +101,26 @@ def build_sequence(
     option_order: Optional[List[int]] = None,
     truncate_left: bool = False,
     state_ids: Optional[List[int]] = None,
+    image_tokens: Optional[List[int]] = None,
+    image_token_id: Optional[int] = None,
 ):
     """Format: [CLS] <type> instructions [SEP] [MASK] opt0 [MASK] opt1 ... [SEP] state [SEP].
 
     `state_ids` lets a caller tokenize the shared state once and reuse it across every question,
     instead of re-serializing and re-tokenizing the same document per question.
+
+    `image_tokens` (one placeholder count per image) puts an image block before the state:
+    ` image 1:` followed by that many `image_token_id` placeholders, then ` image 2:` and so on.
+    The block sits before the state so truncation only ever cuts text; a block that does not fit
+    raises. `image_token_id` is also scrubbed from the text, so user text cannot forge a placeholder.
     """
     mask_tok = tok.mask_token
     opts = render_options(q)
     order = option_order if option_order is not None else list(range(len(opts)))
     ins = str(q["ins"]).replace(mask_tok, " ")
     head_ids = encode_text(tok, "%s question: %s" % (q["t"], ins), add_special_tokens=False)["input_ids"]
+    if image_token_id is not None:
+        head_ids = [i for i in head_ids if i != image_token_id]
     opt_ids = []
     for i in order:
         # Cap at the tokenizer, not after the fact: `[:48]` still makes the tokenizer process the
@@ -123,6 +133,8 @@ def build_sequence(
             truncation=True,
             max_length=48,
         )["input_ids"]
+        if image_token_id is not None:
+            opt_tokens = [i for i in opt_tokens if i != image_token_id]
         opt_ids.append([tok.mask_token_id] + opt_tokens)
     opt_budget = head_max_len - sum(len(o) for o in opt_ids)
     if opt_budget < 16:
@@ -136,23 +148,108 @@ def build_sequence(
         markers.append(len(ids))
         ids.extend(o)
     ids.append(tok.sep_token_id)
+    if image_tokens:
+        block = []
+        for k, n in enumerate(image_tokens):
+            block += encode_text(tok, " image %d:" % (k + 1), add_special_tokens=False)["input_ids"]
+            block += [image_token_id] * n
+        if len(block) > max_len - len(ids) - 1:
+            raise ValueError(
+                "%d images need %d tokens but only %d of max_len=%d are left after the question; "
+                "lower image_patches, pass fewer images or raise max_len"
+                % (len(image_tokens), len(block), max(0, max_len - len(ids) - 1), max_len))
+        ids += block
     room = max(0, max_len - len(ids) - 1)
     if state_ids is None:
         state_ids = encode_text(tok, serialize_state(state).replace(mask_tok, " "),
                                 add_special_tokens=False)["input_ids"]
+    if image_token_id is not None:
+        state_ids = [i for i in state_ids if i != image_token_id]
     # not state_ids[-room:]: with no room left, state_ids[-0:] is the whole state rather than none of it
     st = state_ids[max(0, len(state_ids) - room):] if truncate_left else state_ids[:room]
     ids = ids + st + [tok.sep_token_id]
     return ids[:max_len], [m for m in markers if m < max_len]
 
 
+def open_images(images: List) -> List:
+    """RGB PIL images from PIL images, file paths or encoded bytes."""
+    try:
+        from PIL import Image
+    except ImportError as e:
+        raise ImportError("images need Pillow: pip install 'laya[vision]'") from e
+    out = []
+    for i, im in enumerate(images):
+        if isinstance(im, (bytes, bytearray)):
+            im = Image.open(io.BytesIO(im))
+        elif isinstance(im, (str, os.PathLike)):
+            im = Image.open(im)
+        elif not isinstance(im, Image.Image):
+            raise TypeError("image %d: expected a PIL image, a file path or bytes, got %s" % (i, type(im).__name__))
+        out.append(im.convert("RGB"))
+    return out
+
+
+def load_image_processor(path: str):
+    """The SigLIP2 NaFlex image processor saved at `path` (a checkpoint's `vision/` or a Hub id).
+
+    Not AutoImageProcessor: on transformers 5 that requires torchvision, and the PIL processor
+    does the same job without it.
+    """
+    import importlib.util
+
+    import transformers
+    cls = transformers.Siglip2ImageProcessor
+    if importlib.util.find_spec("torchvision") is None:
+        cls = getattr(transformers, "Siglip2ImageProcessorPil", cls)
+    return cls.from_pretrained(path)
+
+
+def image_grid(h: int, w: int, max_tokens: int):
+    """Token grid for one image's `h` x `w` patch grid: the grid itself when it fits `max_tokens`,
+    else average-pooled down to at most `max_tokens` cells with the aspect ratio kept.
+
+    The tower sees the full patch budget once per image, but every question row repeats the
+    image's tokens, so the cap keeps the per-question cost fixed while the resolution grows.
+    """
+    if h * w <= max_tokens:
+        return h, w
+    s = math.sqrt(max_tokens / (h * w))
+    th = max(1, min(h, int(h * s)))
+    return th, max(1, min(w, int(w * s), max_tokens // th))
+
+
+def image_token_counts(spatial_shapes, max_tokens: int) -> List[int]:
+    """Placeholder count per image, from the processor's `spatial_shapes` ([n, 2] of h, w)."""
+    return [a * b for a, b in (image_grid(int(h), int(w), max_tokens) for h, w in spatial_shapes.tolist())]
+
+
+def _pool_matrix(n_out: int, n_in: int, like: torch.Tensor) -> torch.Tensor:
+    """[n_out, n_in] averaging matrix with adaptive_avg_pool's windows.
+
+    A matmul instead of F.adaptive_avg_pool2d because MPS only implements that op when the input
+    size divides evenly by the output size, and a NaFlex grid rarely does.
+    """
+    m = torch.zeros(n_out, n_in, dtype=like.dtype, device=like.device)
+    for i in range(n_out):
+        a, b = (i * n_in) // n_out, -((-(i + 1) * n_in) // n_out)
+        m[i, a:b] = 1.0 / (b - a)
+    return m
+
+
 class DecisionModel(nn.Module):
     """Bidirectional transformer encoder backbone + typed decision head."""
 
     def __init__(self, encoder: nn.Module, head_layers: int = 2, n_act: int = 2, dropout: float = 0.1,
-                 no_init: bool = False):
+                 no_init: bool = False, vision: Optional[nn.Module] = None, max_image_tokens: int = 0,
+                 image_token_id: Optional[int] = None):
         super().__init__()
         self.encoder = encoder
+        # Optional vision tower (a SigLIP2 NaFlex vision model). Without one nothing below is
+        # registered, so a text-only checkpoint's state dict and forward are unchanged.
+        self.vision = vision
+        self.max_image_tokens = max_image_tokens
+        self.image_token_id = image_token_id
+        self.img_proj = None
         d = encoder.config.hidden_size
         # `no_init` means the caller is about to load every parameter from a checkpoint, so the
         # head's initial values are pure overhead -- and not just time. transformers'
@@ -169,17 +266,53 @@ class DecisionModel(nn.Module):
             self.scorer = nn.Sequential(nn.LayerNorm(d), nn.Linear(d, d), nn.GELU(), nn.Linear(d, 1))
             self.act_head = nn.Sequential(nn.Linear(d + 4, 256), nn.GELU(), nn.Linear(256, n_act))
             self.register_buffer("temperature", torch.ones(3))
+            if vision is not None:
+                dv = vision.config.hidden_size
+                self.img_proj = nn.Sequential(nn.Linear(dv, d), nn.GELU(), nn.Linear(d, d))
         if no_init:
             # Only the modules created above are on the meta device; the encoder is already real
             # and may hold non-persistent buffers (RoPE frequencies) that to_empty would wipe.
-            for module in (self.head, self.type_emb, self.scorer, self.act_head):
+            for module in (self.head, self.type_emb, self.scorer, self.act_head, self.img_proj):
                 if module is not None:
                     module.to_empty(device="cpu")
             self.temperature = torch.empty_like(self.temperature, device="cpu")
         self.head_checkpointing = False
 
-    def forward(self, input_ids, attention_mask, marker_pos, marker_mask, qtype, detach_encoder: bool = False):
-        h = self.encoder(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
+    def encode_images(self, pixel_values, pixel_attention_mask, spatial_shapes) -> List[torch.Tensor]:
+        """One [tokens, d] tensor per image: tower patches pooled to `image_grid`, then projected."""
+        x = self.vision(pixel_values=pixel_values, pixel_attention_mask=pixel_attention_mask,
+                        spatial_shapes=spatial_shapes).last_hidden_state
+        out = []
+        for feats, (h, w) in zip(x, spatial_shapes.tolist()):
+            th, tw = image_grid(h, w, self.max_image_tokens)
+            grid = feats[: h * w].reshape(h, w, -1)     # NaFlex patches are row-major, padding last
+            if (th, tw) != (h, w):
+                grid = torch.einsum("ih,hwd,jw->ijd", _pool_matrix(th, h, grid), grid, _pool_matrix(tw, w, grid))
+            out.append(self.img_proj(grid.reshape(th * tw, -1)))
+        return out
+
+    def forward(self, input_ids, attention_mask, marker_pos, marker_mask, qtype, detach_encoder: bool = False,
+                pixel_values=None, pixel_attention_mask=None, spatial_shapes=None, image_rows=None):
+        if pixel_values is None:
+            h = self.encoder(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
+        else:
+            # Image placeholders get the projected image features; every other position keeps
+            # its token embedding, so the rest of the forward is the text path unchanged.
+            # `image_rows[r]` lists the images (indices into pixel_values) of row r, in order.
+            feats = self.encode_images(pixel_values, pixel_attention_mask, spatial_shapes)
+            emb = self.encoder.get_input_embeddings()(input_ids)
+            slots = input_ids == self.image_token_id
+            per_row = [torch.cat([feats[j] for j in imgs]) for imgs in image_rows if imgs]
+            for r, n in enumerate(slots.sum(-1).tolist()):
+                want = sum(feats[j].size(0) for j in image_rows[r])
+                if n != want:
+                    raise ValueError("row %d has %d image placeholders but its images give %d features"
+                                     % (r, n, want))
+            # Out of place, so autograd reaches the projector through a frozen embedding too.
+            # masked_scatter fills the slots in row-major order: row by row, images in order.
+            if per_row:
+                emb = emb.masked_scatter(slots.unsqueeze(-1), torch.cat(per_row).to(emb.dtype))
+            h = self.encoder(inputs_embeds=emb, attention_mask=attention_mask).last_hidden_state
         if detach_encoder:
             h = h.detach()
         h = h + self.type_emb(qtype)[:, None, :]
@@ -249,30 +382,65 @@ def _no_init_weights():
     return no_init_weights()
 
 
+def _build_vision(vis: Dict, vision_dir: Optional[str], pretrained: bool):
+    """The SigLIP2 NaFlex vision tower, without its pooling head (the decision head replaces it).
+
+    Returns (tower, fresh): `fresh` is True when the weights came from the Hub base model, which
+    means this is a training run and the projector next to it is new too.
+    """
+    from transformers import AutoConfig, AutoModel
+
+    fresh = pretrained and not (vision_dir and os.path.exists(vision_dir))
+    vcfg = AutoConfig.from_pretrained(vis["encoder"] if fresh else (vision_dir or vis["encoder"]))
+    vcfg = getattr(vcfg, "vision_config", vcfg)     # a full SigLIP2 config nests the vision part
+    vcfg.vision_use_head = False
+    if fresh:
+        from transformers import Siglip2VisionModel
+        return Siglip2VisionModel.from_pretrained(vis["encoder"], config=vcfg, attn_implementation="sdpa"), True
+    with _no_init_weights():
+        return AutoModel.from_config(vcfg, attn_implementation="sdpa"), False
+
+
 def build_model(cfg: Dict, encoder_dir: Optional[str] = None, pretrained: bool = True,
-                revision: Optional[str] = None) -> DecisionModel:
+                revision: Optional[str] = None, vision_dir: Optional[str] = None) -> DecisionModel:
     """Build the decision model described by `cfg`.
 
     With `pretrained=False`, or when `encoder_dir` holds a saved encoder config, nothing is
     downloaded and **no parameter is initialised**: the caller is expected to load a checkpoint
     into the result with `load_state_dict(..., strict=True)` immediately. Skipping initialisation
     keeps `load()` from spending time on, or consuming RNG for, weights it is about to overwrite.
+
+    When `cfg` has a `"vision"` block the model also gets a vision tower: from `vision_dir` (the
+    checkpoint's `vision/`) without initialising it, or, with `pretrained=True` and no
+    `vision_dir`, from the Hub base model named in `cfg["vision"]["encoder"]` -- the training
+    case, where the image projector is initialised because no checkpoint has one yet.
     """
     from transformers import AutoConfig, AutoModel
 
     head_layers, n_act = cfg.get("head_layers", 2), len(cfg.get("act_costs", {})) + 1
+    vis = cfg.get("vision")
+    vkw, fresh = {}, False
+    if vis:
+        tower, fresh = _build_vision(vis, vision_dir, pretrained)
+        vkw = {"vision": tower, "max_image_tokens": int(vis["max_image_tokens"]),
+               "image_token_id": int(vis["image_token_id"])}
     if not pretrained or (encoder_dir and os.path.exists(encoder_dir)):
         ecfg = AutoConfig.from_pretrained(encoder_dir or cfg["encoder"])
         _apply_rope_config(ecfg)
         with _no_init_weights():
             enc = AutoModel.from_config(ecfg, attn_implementation="sdpa")
-        return DecisionModel(enc, head_layers, n_act, no_init=True)
+        model = DecisionModel(enc, head_layers, n_act, no_init=True, **vkw)
+        if fresh:
+            for m in model.img_proj:
+                if hasattr(m, "reset_parameters"):
+                    m.reset_parameters()
+        return model
     # Training-time Hub load of the base encoder; allow pinning it like the checkpoints.
     kw = {"attn_implementation": "sdpa"}
     if revision:
         kw["revision"] = revision
     enc = AutoModel.from_pretrained(cfg["encoder"], **kw)
-    return DecisionModel(enc, head_layers, n_act)
+    return DecisionModel(enc, head_layers, n_act, **vkw)
 
 
 def proper_reward(
@@ -430,8 +598,22 @@ def collate_items(batch, pad_id: int):
         "marker_mask": mmask,
         "qtype": torch.tensor([it["qtype"] for it in items]),
         "label": torch.tensor([it.get("label", -1) for it in items]),
-        "meta": [{k: it[k] for k in it if k not in ("ids", "markers", "target")} for it in items],
+        "meta": [{k: it[k] for k in it if k not in ("ids", "markers", "target", "vision")} for it in items],
     }
     if target is not None:
         res["target"] = target
+    # Images belong to a state, so every row of a group shares its group's `vision` tensors
+    # (the image processor output). Each set is stacked once and rows point at their images.
+    shared, image_rows, n = [], [], 0
+    for group in batch:
+        vision = next((it["vision"] for it in group if it.get("vision")), None)
+        idx = list(range(n, n + len(vision["spatial_shapes"]))) if vision else []
+        if vision:
+            shared.append(vision)
+            n += len(idx)
+        image_rows += [idx] * len(group)
+    if shared:
+        for key in ("pixel_values", "pixel_attention_mask", "spatial_shapes"):
+            res[key] = torch.cat([v[key] for v in shared])
+        res["image_rows"] = image_rows
     return res

@@ -24,6 +24,9 @@ from .common import (
     confidence_from_probs,
     _resolve_noul_labels,
     encode_text,
+    image_token_counts,
+    load_image_processor,
+    open_images,
     render_options,
     serialize_state,
     temp_bucket,
@@ -103,6 +106,8 @@ def _verify_compatibility(model: torch.nn.Module, cfg: Dict, weights: Dict[str, 
 
     # 2. Check for required component prefixes
     required_prefixes = ("encoder.", "type_emb.", "scorer.", "act_head.")
+    if cfg.get("vision"):
+        required_prefixes += ("vision.", "img_proj.")
     for prefix in required_prefixes:
         if not any(k.startswith(prefix) for k in weights.keys()):
             raise ValueError(
@@ -232,6 +237,8 @@ class Agent(HookRegistry):
     mps_amp_min_rows = MPS_AMP_MIN_ROWS_DEFAULT
     # The stock forward is also used by lightweight runtimes built with __new__ in tests.
     _fast = None
+    # Set only for a checkpoint with a vision tower.
+    image_processor = None
 
     def __init__(
         self,
@@ -299,7 +306,7 @@ class Agent(HookRegistry):
             kw = {
                 "token": token or os.environ.get("HF_TOKEN") or None,
                 "allow_patterns": [prefix + name for name in (
-                    "rl_agent_config.json", "model.safetensors", "tokenizer/*", "encoder/*",
+                    "rl_agent_config.json", "model.safetensors", "tokenizer/*", "encoder/*", "vision/*",
                 )],
             }
             if revision:
@@ -365,9 +372,19 @@ class Agent(HookRegistry):
         self.tok = _load_tokenizer(tok_dir, self.cfg)
 
         enc_dir = os.path.join(model_dir, "encoder")
+        vision_dir = os.path.join(model_dir, "vision")
+        self.image_processor = None
+        if self.cfg.get("vision"):
+            if fast:
+                raise ValueError("fast=True does not support vision checkpoints yet: the TileLang path "
+                                 "only takes token ids. Load %r without fast=True." % model_id_or_path)
+            if not os.path.isdir(vision_dir):
+                raise FileNotFoundError("vision checkpoint %r has no 'vision/' directory (the tower config "
+                                        "and image processor ship there)" % model_id_or_path)
+            self.image_processor = load_image_processor(vision_dir)
         # build_model skips initialisation of every parameter; the checkpoint supplies them all.
         self.model = build_model(self.cfg, encoder_dir=enc_dir if os.path.exists(enc_dir) else None,
-                                 pretrained=False)
+                                 pretrained=False, vision_dir=vision_dir if self.image_processor else None)
 
         # Load weights and verify architectural compatibility
         weights = load_file(weights_path)
@@ -500,6 +517,8 @@ class Agent(HookRegistry):
         """
         if self._fast is not None:
             return True
+        if self.image_processor is not None:
+            raise ValueError("the fast path does not support vision checkpoints yet: it only takes token ids")
         if self.device.type != "cuda":
             if strict:
                 raise RuntimeError("laya fast path needs a CUDA device")
@@ -645,12 +664,26 @@ class Agent(HookRegistry):
             q["labels"] = qdef["labels"]
         return q
 
+    def _encode_images(self, images: List[Any], image_patches: Optional[int] = None):
+        """Run the image processor over one state's images.
+
+        Returns the processor tensors (shared by every question row of the state) and the
+        placeholder count per image. Images are PIL images, file paths or encoded bytes.
+        """
+        opened = open_images(images)
+        vis = self.cfg["vision"]
+        patches = int(image_patches or vis.get("max_num_patches", 1024))
+        out = self.image_processor(opened, max_num_patches=patches, return_tensors="pt")
+        tensors = {k: out[k] for k in ("pixel_values", "pixel_attention_mask", "spatial_shapes")}
+        return tensors, image_token_counts(out["spatial_shapes"], int(vis["max_image_tokens"]))
+
     def _encode_state(self, state: Union[str, dict, list], ids: List[str], internal: Dict[str, Dict],
-                      max_len: Optional[int] = None, head_max_len: Optional[int] = None) -> List[Dict]:
+                      max_len: Optional[int] = None, head_max_len: Optional[int] = None,
+                      images: Optional[List[Any]] = None, image_patches: Optional[int] = None) -> List[Dict]:
         """Tokenize one state against every (already validated + normalized) question.
 
         `max_len` / `head_max_len` override the agent config for this call (a start hook may set
-        `ctx.max_len` / `ctx.head_max_len`).
+        `ctx.max_len` / `ctx.head_max_len`). `images` are this state's images, in order.
         """
         max_len = self.cfg.get("max_len", 512) if max_len is None else max_len
         head_max_len = self.cfg.get("head_max_len", 192) if head_max_len is None else head_max_len
@@ -667,14 +700,20 @@ class Agent(HookRegistry):
             serialize_state(state).replace(self.tok.mask_token, " "),
             add_special_tokens=False,
         )["input_ids"]
+        vision, image_tokens = (self._encode_images(images, image_patches) if images else (None, None))
+        image_token_id = (self.cfg.get("vision") or {}).get("image_token_id")
         items = []
         for qid in ids:
             q = internal[qid]
             seq, markers = build_sequence(self.tok, state, q, max_len, head_max_len,
-                                          truncate_left=truncate_left, state_ids=state_ids)
+                                          truncate_left=truncate_left, state_ids=state_ids,
+                                          image_tokens=image_tokens, image_token_id=image_token_id)
             if len(markers) != len(render_options(q)):
                 raise ValueError("question %r options exceed head_max_len=%d" % (qid, head_max_len))
-            items.append({"ids": seq, "markers": markers, "qtype": QTYPES[q["t"]]})
+            item = {"ids": seq, "markers": markers, "qtype": QTYPES[q["t"]]}
+            if vision:
+                item["vision"] = vision
+            items.append(item)
         return items
 
     def _amp_enabled_for(self, rows: int) -> bool:
@@ -704,6 +743,11 @@ class Agent(HookRegistry):
             # Recomputed inside run() so a fallback that disables amp (or moves to CPU) takes
             # effect on the retry. A disabled gate never enters torch.autocast at all.
             enabled = self._amp_enabled_for(b["input_ids"].shape[0])
+            images = {}
+            if "pixel_values" in b:
+                images = {k: b[k].to(self.device)
+                          for k in ("pixel_values", "pixel_attention_mask", "spatial_shapes")}
+                images["image_rows"] = b["image_rows"]
             with _amp_context(self.device, self.dtype, enabled):
                 return self.model(
                     b["input_ids"].to(self.device),
@@ -711,6 +755,7 @@ class Agent(HookRegistry):
                     b["marker_pos"].to(self.device),
                     b["marker_mask"].to(self.device),
                     b["qtype"].to(self.device),
+                    **images,
                 )
 
         try:
@@ -822,7 +867,9 @@ class Agent(HookRegistry):
                       hooks_timeout: Optional[float] = None,
                       max_len: Optional[int] = None,
                       head_max_len: Optional[int] = None,
-                      sort_by_length: bool = False) -> List[Dict[str, Any]]:
+                      sort_by_length: bool = False,
+                      images: Optional[List[Optional[List[Any]]]] = None,
+                      image_patches: Optional[int] = None) -> List[Dict[str, Any]]:
         """Evaluate the same questions over many states, packing them into shared forward passes.
 
         This is the throughput path. `system_one`/`predict` handle one state per forward pass; on a
@@ -852,6 +899,16 @@ class Agent(HookRegistry):
                     smaller than the number of states; otherwise it has no effect. Results retain
                     input order. This buffers up to eight batches of tokenized states instead of
                     one. Changing batch shapes can slightly change floating-point predictions.
+            images: Needs a vision checkpoint. One list of images per state, aligned with
+                    `states` by index (`None` or `[]` for a state without images). An image is a
+                    PIL image, a file path or encoded bytes; several images, or the frames of a
+                    clip, go in order and the questions can refer to them as "image 1", "image 2".
+                    A start hook may rewrite or redact `ctx.images`.
+            image_patches: Override the checkpoint's `max_num_patches` for this call: how many
+                    16px patches the vision tower gets per image. More patches keep more detail
+                    (2048 keeps small text in a 1080p screenshot legible) and cost more tower time,
+                    while the tokens each image adds to every question row stay capped by the
+                    checkpoint's `max_image_tokens`. A start hook may set `ctx.image_patches`.
 
         Returns:
             A list of per-state result dicts, each identical in shape to `system_one`'s output and
@@ -861,7 +918,8 @@ class Agent(HookRegistry):
         raise_errors = self.hooks_raise if hooks_raise is None else bool(hooks_raise)
         timeout = self.hooks_timeout if hooks_timeout is None else validate_timeout(hooks_timeout)
         ctx = PredictContext(states=states, questions=questions, model=self.model_id, agent=self,
-                             max_len=max_len, head_max_len=head_max_len)
+                             max_len=max_len, head_max_len=head_max_len,
+                             images=images, image_patches=image_patches)
         try:
             dispatch(active, "on_predict_start", ctx, raise_errors=raise_errors, lock=self._hooks_lock, timeout=timeout)
             states, questions = ctx.states, ctx.questions
@@ -873,6 +931,17 @@ class Agent(HookRegistry):
                         "predict_batch expects a list of states; pass a single state to predict()/system_one()."
                     )
                 states = list(states)
+                images = ctx.images
+                if images is not None:
+                    if self.image_processor is None:
+                        raise ValueError("checkpoint %r has no vision encoder; images need a vision checkpoint"
+                                         % (self.model_id,))
+                    images = list(images)
+                    if len(images) != len(states):
+                        raise ValueError("images: expected one list of images per state, got %d lists for "
+                                         "%d states" % (len(images), len(states)))
+                else:
+                    images = [None] * len(states)
                 if not states:
                     ctx.results = []
                 else:
@@ -896,6 +965,8 @@ class Agent(HookRegistry):
                             overrides["max_len"] = ctx.max_len
                         if ctx.head_max_len is not None:
                             overrides["head_max_len"] = ctx.head_max_len
+                        if ctx.image_patches is not None:
+                            overrides["image_patches"] = ctx.image_patches
 
                         results: List[Dict[str, Any]] = []
                         reorder = sort_by_length and 1 < chunk < len(states)
@@ -904,7 +975,11 @@ class Agent(HookRegistry):
                         window = chunk * 8 if reorder else chunk
                         for start in range(0, len(states), window):
                             part = states[start:start + window]
-                            encoded = [self._encode_state(st, ids, internal, **overrides) for st in part]
+                            # `images` only when given, like the overrides, so a stand-in
+                            # `_encode_state` without it keeps working on text.
+                            encoded = [self._encode_state(st, ids, internal, **overrides,
+                                                          **({"images": imgs} if imgs else {}))
+                                       for st, imgs in zip(part, images[start:start + window])]
                             order = list(range(len(encoded)))
                             if reorder:
                                 order.sort(key=lambda i: max(len(item["ids"]) for item in encoded[i]))
@@ -1061,7 +1136,9 @@ class Agent(HookRegistry):
                    hooks_raise: Optional[bool] = None,
                    hooks_timeout: Optional[float] = None,
                    max_len: Optional[int] = None,
-                   head_max_len: Optional[int] = None) -> Dict[str, Any]:
+                   head_max_len: Optional[int] = None,
+                   images: Optional[List[Any]] = None,
+                   image_patches: Optional[int] = None) -> Dict[str, Any]:
         """Evaluate typed questions across state in a single, parallel forward pass.
 
         Args:
@@ -1076,6 +1153,8 @@ class Agent(HookRegistry):
                   Noul criteria and labels are optional. Labels only control the text shown to the
                   model; their keys retain false/true semantics, and the returned `noul` value is
                   always P(true). Labels default to false/true for compatibility.
+            images: This state's images, in order (needs a vision checkpoint); see `predict_batch`.
+            image_patches: Vision tower patches per image for this call; see `predict_batch`.
 
         Returns:
             Dictionary with answers, probabilities, calibrated confidence, and token usage.
@@ -1088,7 +1167,9 @@ class Agent(HookRegistry):
                                   on_predict_start=on_predict_start,
                                   on_predict_end=on_predict_end, hooks_raise=hooks_raise,
                                   hooks_timeout=hooks_timeout,
-                                  max_len=max_len, head_max_len=head_max_len)[0]
+                                  max_len=max_len, head_max_len=head_max_len,
+                                  images=None if images is None else [images],
+                                  image_patches=image_patches)[0]
 
     def __enter__(self):
         return self

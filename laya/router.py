@@ -50,6 +50,9 @@ DEFAULT_MODELS = {
     "typed-decisions": (BUNDLE_REPO, "typed-decisions"),
 }
 
+# Names a caller may register with `Router(models=...)` that have no published checkpoint yet.
+OPTIONAL_MODELS = ("vision",)
+
 # The same checkpoints also live in their own repos, for anyone who prefers them.
 STANDALONE_MODELS = {
     "english": "convaiinnovations/laya",
@@ -110,10 +113,15 @@ class RouteDecision(dict):
 def normalise_name(name: str) -> str:
     key = str(name).strip().lower()
     key = _ALIASES.get(key, key)
-    if key not in DEFAULT_MODELS:
+    if key not in DEFAULT_MODELS and key not in OPTIONAL_MODELS:
         raise ValueError("unknown model %r; choose one of %s (or an alias: %s)"
-                         % (name, sorted(DEFAULT_MODELS), sorted(_ALIASES)))
+                         % (name, sorted(DEFAULT_MODELS) + list(OPTIONAL_MODELS), sorted(_ALIASES)))
     return key
+
+
+def _no_vision_error() -> ValueError:
+    return ValueError("images need a vision checkpoint and none is registered; pass "
+                      "Router(models={'vision': <repo id or local path>})")
 
 
 def match_typed_decisions_workflow(questions: Dict[str, Any]) -> Optional[str]:
@@ -282,6 +290,8 @@ class Router(HookRegistry):
         Concurrent callers share a single Agent instead of building duplicates.
         """
         key = normalise_name(name)
+        if key not in self.models:
+            raise _no_vision_error()
         with self._lock:
             if key in self._agents:
                 self._touch(key)
@@ -439,14 +449,17 @@ class Router(HookRegistry):
         hooks=None,
         hooks_raise: Optional[bool] = None,
         hooks_timeout: Optional[float] = None,
+        images: Optional[List[Any]] = None,
     ) -> RouteDecision:
         """Decide which checkpoint to use, then let `on_route` hooks observe or replace it.
 
         `ctx.decision` is the `RouteDecision`; a hook may replace it (for example to pin a
         checkpoint) and the replacement is what gets returned and used. `hooks` are per-call
-        hooks, appended after any installed on the Router.
+        hooks, appended after any installed on the Router. A non-empty `images` routes to the
+        registered `"vision"` checkpoint unless `model` or `task` names one.
         """
-        decision = self._route(state, questions, model=model, task=task, lang=lang, lang_guess=lang_guess)
+        decision = self._route(state, questions, model=model, task=task, lang=lang, lang_guess=lang_guess,
+                               images=images)
         raise_errors = self.hooks_raise if hooks_raise is None else bool(hooks_raise)
         active = compose_hooks(self.hooks, hooks)
         timeout = self.hooks_timeout if hooks_timeout is None else validate_timeout(hooks_timeout)
@@ -462,11 +475,12 @@ class Router(HookRegistry):
         task: Optional[str] = None,
         lang: Optional[str] = None,
         lang_guess: Optional[Any] = None,
+        images: Optional[List[Any]] = None,
     ) -> RouteDecision:
         """Decide which checkpoint to use, without loading or running anything.
 
-        Precedence: explicit `model` > explicit `task` > detected workflow (opt-in) >
-        explicit `lang` > `lang_guess` > detected script/language > default.
+        Precedence: explicit `model` > explicit `task` > images (to `"vision"`) > detected
+        workflow (opt-in) > explicit `lang` > `lang_guess` > detected script/language > default.
 
         `lang_guess` is an opt-in hint -- a language code or a callable taking the state --
         checked after an explicit `lang` and before the built-in detection. It only answers
@@ -483,6 +497,13 @@ class Router(HookRegistry):
         if task is not None:
             key = normalise_name("typed-decisions" if str(task).lower().replace("-", "_") == "typed_decisions" else task)
             return RouteDecision(model=key, repo=_repo_str(self.models[key]), reason="explicit task=%r" % task,
+                                 detection=None, workflow=None)
+
+        if images:
+            if "vision" not in self.models:
+                raise _no_vision_error()
+            return RouteDecision(model="vision", repo=_repo_str(self.models["vision"]),
+                                 reason="%d image(s) given; only the vision checkpoint reads images" % len(images),
                                  detection=None, workflow=None)
 
         workflow = match_typed_decisions_workflow(questions or {})
@@ -563,6 +584,8 @@ class Router(HookRegistry):
         hooks_timeout: Optional[float] = None,
         max_len: Optional[int] = None,
         head_max_len: Optional[int] = None,
+        images: Optional[List[Any]] = None,
+        image_patches: Optional[int] = None,
     ) -> Dict[str, Any]:
         """Route, then answer every question in one forward pass on the chosen checkpoint.
 
@@ -570,6 +593,8 @@ class Router(HookRegistry):
         Router-level `on_predict_start` / `on_predict_end` hooks wrap the whole route+infer call
         and see `ctx.decision`; see `laya.hooks`. `max_len` / `head_max_len` override the agent
         token budget for this call (a start hook may set `ctx.max_len` / `ctx.head_max_len`).
+        `images` (this state's images, in order) route the call to the registered `"vision"`
+        checkpoint; `image_patches` sets its per-image patch budget. See `Agent.predict_batch`.
         """
         active = compose_hooks(self.hooks, hooks, on_predict_start, on_predict_end)
         raise_errors = self.hooks_raise if hooks_raise is None else bool(hooks_raise)
@@ -578,7 +603,7 @@ class Router(HookRegistry):
         # Per-call hooks apply to the whole call, including on_route inside route().
         decision = self.route(state, questions, model=model, task=task, lang=lang,
                               lang_guess=lang_guess, hooks=hooks, hooks_raise=hooks_raise,
-                              hooks_timeout=hooks_timeout)
+                              hooks_timeout=hooks_timeout, images=images)
         agent = self.load(decision["model"])
         effective_lang = lang
         if effective_lang is None and decision.get("detection") and decision["detection"].get("language"):
@@ -586,7 +611,8 @@ class Router(HookRegistry):
 
         ctx = PredictContext(states=[state], questions=questions, decision=dict(decision),
                              model=decision["model"], agent=agent, router=self,
-                             max_len=max_len, head_max_len=head_max_len)
+                             max_len=max_len, head_max_len=head_max_len,
+                             images=images, image_patches=image_patches)
         try:
             dispatch(active, "on_predict_start", ctx, raise_errors=raise_errors, lock=self._hooks_lock, timeout=timeout)
             if ctx.results is None:
@@ -597,6 +623,10 @@ class Router(HookRegistry):
                     overrides["max_len"] = ctx.max_len
                 if ctx.head_max_len is not None:
                     overrides["head_max_len"] = ctx.head_max_len
+                if ctx.images is not None:
+                    overrides["images"] = ctx.images
+                if ctx.image_patches is not None:
+                    overrides["image_patches"] = ctx.image_patches
                 
                 skip = _SKIP_DEFAULTS.set(True)
                 try:
@@ -733,6 +763,8 @@ class Router(HookRegistry):
         Returns:
             One normal Router prediction result per request, in the same order as the input.
         """
+        if any(r.get("images") for r in requests):
+            raise ValueError("Router.predict_batch does not take images yet; use Router.predict")
         decisions = self.route_batch(requests)
         if not decisions:
             return []
